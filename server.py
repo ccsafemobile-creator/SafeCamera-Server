@@ -1,3 +1,7 @@
+import os
+import hmac
+import json
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 app = FastAPI(title="SafeCamera Signaling Server")
@@ -14,22 +18,38 @@ async def health():
 
 @app.websocket("/signal/{room_id}")
 async def signaling(websocket: WebSocket, room_id: str):
+
     await websocket.accept()
 
-    if room_id not in rooms:
-        rooms[room_id] = []
+    secret = os.environ.get("SAFECAMERA_PAIRING_TOKEN")
 
-    if len(rooms[room_id]) >= 2:
-        await websocket.send_json({
-            "type": "error",
-            "message": "Room is full"
-        })
-        await websocket.close()
+    if not secret:
+        await websocket.close(code=1011)
         return
 
-    rooms[room_id].append(websocket)
-
     try:
+        # First message must contain the pairing password
+        auth_data = json.loads(await websocket.receive_text())
+
+        if not isinstance(auth_data, dict):
+            await websocket.close(code=1008)
+            return
+
+        supplied_token = auth_data.get("token", "")
+
+        if not isinstance(supplied_token, str) or not hmac.compare_digest(supplied_token, secret):
+            await websocket.close(code=1008)
+            return
+
+        if room_id not in rooms:
+            rooms[room_id] = []
+
+        if len(rooms[room_id]) >= 2:
+            await websocket.close(code=1008)
+            return
+
+        rooms[room_id].append(websocket)
+
         await websocket.send_json({
             "type": "joined",
             "room": room_id,
@@ -39,11 +59,11 @@ async def signaling(websocket: WebSocket, room_id: str):
         while True:
             data = await websocket.receive_text()
 
-            for peer in rooms[room_id]:
+            for peer in list(rooms.get(room_id, [])):
                 if peer != websocket:
                     await peer.send_text(data)
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, json.JSONDecodeError):
         pass
 
     finally:
@@ -53,4 +73,3 @@ async def signaling(websocket: WebSocket, room_id: str):
 
             if not rooms[room_id]:
                 del rooms[room_id]
-
