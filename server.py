@@ -9,9 +9,10 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
     HTTPException,
-    Header
+    Header,
+    Request
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 app = FastAPI(title="SafeCamera Signaling Server")
@@ -20,9 +21,13 @@ app = FastAPI(title="SafeCamera Signaling Server")
 pair_codes = {}
 sessions = {}
 rooms = {}
+rate_limits = {}
 
 PAIR_CODE_EXPIRY = 300
 SESSION_EXPIRY = 30 * 24 * 60 * 60
+
+RATE_LIMIT_WINDOW = 900       # 15 minutes
+MAX_ATTEMPTS = 5
 
 
 # -------------------------
@@ -49,14 +54,13 @@ def get_session(token: str):
     if not token:
         return None
 
-    token_hash = hash_token(token)
-    session = sessions.get(token_hash)
+    session = sessions.get(hash_token(token))
 
     if not session:
         return None
 
     if session["expires_at"] < time.time():
-        sessions.pop(token_hash, None)
+        sessions.pop(hash_token(token), None)
         return None
 
     return session
@@ -72,6 +76,39 @@ def get_bearer_token(authorization):
         return None
 
     return parts[1].strip()
+
+
+def check_rate_limit(key: str):
+    now = time.time()
+
+    record = rate_limits.get(key)
+
+    if record is None or now - record["start"] >= RATE_LIMIT_WINDOW:
+        rate_limits[key] = {
+            "start": now,
+            "count": 1
+        }
+        return
+
+    if record["count"] >= MAX_ATTEMPTS:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many attempts. Try again after 15 minutes."
+        )
+
+    record["count"] += 1
+
+
+def clean_expired_codes():
+    now = time.time()
+
+    expired = [
+        code for code, data in pair_codes.items()
+        if data["expires_at"] < now
+    ]
+
+    for code in expired:
+        pair_codes.pop(code, None)
 
 
 # -------------------------
@@ -101,29 +138,34 @@ async def health():
 # Phone 1
 # -------------------------
 
+class CreatePairRequest(BaseModel):
+    pin: str = Field(min_length=8, max_length=128)
+
+
 @app.post("/pair/create")
 async def create_pair(
-    authorization: str | None = Header(default=None)
+    request: Request,
+    data: CreatePairRequest
 ):
+    client_ip = request.client.host if request.client else "unknown"
 
-    expected_token = os.getenv("SAFECAMERA_PAIRING_TOKEN")
+    check_rate_limit(f"create:{client_ip}")
 
-    if not expected_token:
+    expected_pin = os.getenv("SAFECAMERA_PAIRING_PIN")
+
+    if not expected_pin:
         raise HTTPException(
             status_code=503,
-            detail="Server pairing configuration missing"
+            detail="Pairing PIN is not configured on server"
         )
 
-    supplied_token = get_bearer_token(authorization)
-
-    if not supplied_token or not hmac.compare_digest(
-        supplied_token,
-        expected_token
-    ):
+    if not hmac.compare_digest(data.pin, expected_pin):
         raise HTTPException(
             status_code=401,
-            detail="Unauthorized"
+            detail="Incorrect pairing PIN"
         )
+
+    clean_expired_codes()
 
     code = str(secrets.randbelow(900000) + 100000)
 
@@ -132,10 +174,7 @@ async def create_pair(
 
     room_id = secrets.token_urlsafe(16)
 
-    camera_token = create_session(
-        room_id,
-        "camera"
-    )
+    camera_token = create_session(room_id, "camera")
 
     pair_codes[code] = {
         "room_id": room_id,
@@ -148,7 +187,8 @@ async def create_pair(
         "pairing_code": code,
         "room_id": room_id,
         "session_token": camera_token,
-        "role": "camera"
+        "role": "camera",
+        "expires_in_seconds": PAIR_CODE_EXPIRY
     }
 
 
@@ -158,15 +198,21 @@ async def create_pair(
 # -------------------------
 
 class RedeemRequest(BaseModel):
-    code: str
+    code: str = Field(min_length=6, max_length=6)
 
 
 @app.post("/pair/redeem")
-async def redeem_pair(request: RedeemRequest):
+async def redeem_pair(
+    request: Request,
+    data: RedeemRequest
+):
+    client_ip = request.client.host if request.client else "unknown"
 
-    code = request.code.strip()
+    check_rate_limit(f"redeem:{client_ip}")
 
-    if not code.isdigit() or len(code) != 6:
+    code = data.code.strip()
+
+    if not code.isdigit():
         raise HTTPException(
             status_code=400,
             detail="Invalid pairing code"
@@ -177,7 +223,7 @@ async def redeem_pair(request: RedeemRequest):
     if not pair:
         raise HTTPException(
             status_code=404,
-            detail="Pairing code not found"
+            detail="Pairing code not found or already used"
         )
 
     if pair["expires_at"] < time.time():
@@ -193,10 +239,7 @@ async def redeem_pair(request: RedeemRequest):
 
     room_id = pair["room_id"]
 
-    viewer_token = create_session(
-        room_id,
-        "viewer"
-    )
+    viewer_token = create_session(room_id, "viewer")
 
     return {
         "session_token": viewer_token,
@@ -214,7 +257,6 @@ async def redeem_pair(request: RedeemRequest):
 async def check_session(
     authorization: str | None = Header(default=None)
 ):
-
     token = get_bearer_token(authorization)
     session = get_session(token)
 
@@ -239,7 +281,6 @@ async def check_session(
 async def logout(
     authorization: str | None = Header(default=None)
 ):
-
     token = get_bearer_token(authorization)
 
     if not token:
@@ -266,8 +307,10 @@ async def signaling(
     websocket: WebSocket,
     room_id: str
 ):
-
     await websocket.accept()
+
+    role = None
+    room = None
 
     try:
         # First message must contain session token
@@ -318,10 +361,7 @@ async def signaling(
             "users": len(room)
         })
 
-        # Notify the other device
-        other_role = (
-            "viewer" if role == "camera" else "camera"
-        )
+        other_role = "viewer" if role == "camera" else "camera"
 
         peer = room.get(other_role)
 
@@ -347,24 +387,20 @@ async def signaling(
         pass
 
     finally:
-        room = rooms.get(room_id)
-
-        if room:
-            if room.get(role if 'role' in locals() else None) == websocket:
+        if room is not None and role is not None:
+            if room.get(role) is websocket:
                 room.pop(role, None)
 
-            peer = room.get(
-                "viewer" if locals().get("role") == "camera"
-                else "camera"
-            )
+                other_role = "viewer" if role == "camera" else "camera"
+                peer = room.get(other_role)
 
-            if peer:
-                try:
-                    await peer.send_json({
-                        "type": "peer_left"
-                    })
-                except Exception:
-                    pass
+                if peer:
+                    try:
+                        await peer.send_json({
+                            "type": "peer_left"
+                        })
+                    except Exception:
+                        pass
 
             if not room:
                 rooms.pop(room_id, None)
